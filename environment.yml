@@ -1,0 +1,12 @@
+name: gnn_mpro
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - polars
+  - sqlalchemy
+  - psycopg2
+  - pip
+  - pip:
+    - adbc-driver-postgresql

@@ -26,7 +26,7 @@ from Bio.PDB import PDBParser, DSSP
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(SCRIPT_DIR, "MPro-URV_Version2")
+DATA_PATH = os.path.join(SCRIPT_DIR, "MPro-URV")
 URI_DB = "postgresql://admin:admin@127.0.0.1:5432/db_preproc"
 
 # Amino acids recognised by the GNN code
@@ -100,7 +100,7 @@ def load_splits(data_path: str) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 def migrate_dataset(data_path: str, uri: str) -> None:
-    print("[*] Reading Info.csv …")
+    print("[*] Reading Info.csv ...")
     df = pl.read_csv(os.path.join(data_path, "Info.csv"), separator=";")
     df = df.rename({c: c.lower().replace(" ", "_") for c in df.columns})
 
@@ -110,7 +110,7 @@ def migrate_dataset(data_path: str, uri: str) -> None:
                 df = df.rename({candidate: "pdb_id"})
                 break
 
-    print("[*] Generating file paths …")
+    print("[*] Generating file paths ...")
     df = df.with_columns([
         pl.concat_str([pl.lit(f"{data_path}/Complex/ALIGNED/"),
                        pl.col("pdb_id"), pl.lit(".cif")]).alias("path_complex_aligned"),
@@ -135,7 +135,7 @@ def migrate_dataset(data_path: str, uri: str) -> None:
                        pl.col("pdb_id"), pl.lit("_protein.pdb")]).alias("path_protein_pdb"),
     ])
 
-    print(f"[*] Writing mpro_dataset ({df.height} rows, {df.width} cols) …")
+    print(f"[*] Writing mpro_dataset ({df.height} rows, {df.width} cols) ...")
     df.write_database(
         table_name="mpro_dataset",
         connection=uri,
@@ -150,7 +150,7 @@ def migrate_dataset(data_path: str, uri: str) -> None:
 # ---------------------------------------------------------------------------
 
 def migrate_fold_assignments(data_path: str, uri: str) -> None:
-    print("[*] Loading split files …")
+    print("[*] Loading split files ...")
     df = load_splits(data_path)
 
     if df.height == 0:
@@ -158,7 +158,7 @@ def migrate_fold_assignments(data_path: str, uri: str) -> None:
         return
 
     num_folds = df["fold_index"].n_unique()
-    print(f"[*] Writing fold_assignments ({df.height} rows, {num_folds} fold(s)) …")
+    print(f"[*] Writing fold_assignments ({df.height} rows, {num_folds} fold(s)) ...")
     df.write_database(
         table_name="fold_assignments",
         connection=uri,
@@ -213,7 +213,7 @@ def _parse_universal_interactions(pdb_id: str, path: str) -> list[dict]:
 
 def migrate_interactions(data_path: str, uri: str) -> None:
     json_files = sorted(glob.glob(os.path.join(data_path, "Interaction", "*.json")))
-    print(f"[*] Parsing {len(json_files)} interaction JSON files …")
+    print(f"[*] Parsing {len(json_files)} interaction JSON files ...")
 
     all_rows: list[dict] = []
     for path in json_files:
@@ -225,18 +225,19 @@ def migrate_interactions(data_path: str, uri: str) -> None:
         return
 
     df = pl.DataFrame(all_rows).with_columns([
-        pl.col("protein_res_id").cast(pl.Utf8).cast(pl.Int32, strict=False),
+        pl.col("bgn_res_id").cast(pl.Utf8).cast(pl.Int32, strict=False),
+        pl.col("end_res_id").cast(pl.Utf8).cast(pl.Int32, strict=False),
         pl.col("distance").cast(pl.Float32),
     ])
 
-    print(f"[*] Writing interactions_pl ({df.height} rows) …")
+    print(f"[*] Writing interactions_all ({df.height} rows) ...")
     df.write_database(
-        table_name="interactions_pl",
+        table_name="interactions_all",
         connection=uri,
         if_table_exists="replace",
         engine="adbc",
     )
-    print("[V] interactions_pl done.\n")
+    print("[V] interactions_all done.\n")
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +299,7 @@ def migrate_ligand_atoms(data_path: str, uri: str) -> None:
     cif_files = sorted(glob.glob(
         os.path.join(data_path, "Ligand", "Ligand_CIF", "*.cif")
     ))
-    print(f"[*] Parsing {len(cif_files)} ligand CIF files …")
+    print(f"[*] Parsing {len(cif_files)} ligand CIF files ...")
 
     all_rows: list[dict] = []
     for path in cif_files:
@@ -315,7 +316,7 @@ def migrate_ligand_atoms(data_path: str, uri: str) -> None:
         pl.col("z").cast(pl.Float32),
     ])
 
-    print(f"[*] Writing ligand_atoms ({df.height} rows) …")
+    print(f"[*] Writing ligand_atoms ({df.height} rows) ...")
     df.write_database(
         table_name="ligand_atoms",
         connection=uri,
@@ -377,7 +378,7 @@ def migrate_ligand_bonds(data_path: str, uri: str) -> None:
     sdf_files = sorted(glob.glob(
         os.path.join(data_path, "Ligand", "Ligand_SDF", "*.sdf")
     ))
-    print(f"[*] Parsing {len(sdf_files)} ligand SDF files for bonds …")
+    print(f"[*] Parsing {len(sdf_files)} ligand SDF files for bonds ...")
 
     all_rows: list[dict] = []
     for path in sdf_files:
@@ -394,7 +395,7 @@ def migrate_ligand_bonds(data_path: str, uri: str) -> None:
         pl.col("bond_order").cast(pl.Int32),
     ])
 
-    print(f"[*] Writing ligand_bonds ({df.height} rows) …")
+    print(f"[*] Writing ligand_bonds ({df.height} rows) ...")
     df.write_database(
         table_name="ligand_bonds",
         connection=uri,
@@ -463,7 +464,7 @@ def migrate_full_protein_data(data_path: str, uri: str) -> None:
     """Creates protein_residues and protein_atoms."""
     
     pdb_files = sorted(glob.glob(os.path.join(data_path, "Protein", "Protein_PDB", "*.pdb")))
-    print(f"[*] Extracting full protein data for {len(pdb_files)} structures …")
+    print(f"[*] Extracting full protein data for {len(pdb_files)} structures ...")
 
     all_residue_rows: list[dict] = []
     all_atom_rows: list[dict] = []
@@ -479,7 +480,7 @@ def migrate_full_protein_data(data_path: str, uri: str) -> None:
         df_res = pl.DataFrame(all_residue_rows).with_columns(
             pl.col("residue_num").cast(pl.Int32)
         )
-        print(f"[*] Writing protein_residues ({df_res.height} rows) …")
+        print(f"[*] Writing protein_residues ({df_res.height} rows) ...")
         df_res.write_database(
             table_name="protein_residues",
             connection=uri,
@@ -495,7 +496,7 @@ def migrate_full_protein_data(data_path: str, uri: str) -> None:
             pl.col("y").cast(pl.Float32),
             pl.col("z").cast(pl.Float32),
         ])
-        print(f"[*] Writing protein_atoms ({df_atm.height} rows) …")
+        print(f"[*] Writing protein_atoms ({df_atm.height} rows) ...")
         df_atm.write_database(
             table_name="protein_atoms",
             connection=uri,
@@ -580,7 +581,7 @@ def migrate_secondary_structure(data_path: str, uri: str) -> None:
     dssp_files = sorted(glob.glob(
         os.path.join(data_path, "Protein", "Protein_DSSP", "*.dssp")
     ))
-    print(f"[*] Parsing {len(dssp_files)} DSSP files …")
+    print(f"[*] Parsing {len(dssp_files)} DSSP files ...")
 
     all_rows: list[dict] = []
     for path in dssp_files:
@@ -598,7 +599,7 @@ def migrate_secondary_structure(data_path: str, uri: str) -> None:
         pl.col("psi").cast(pl.Float32),
     ])
 
-    print(f"[*] Writing protein_secondary_structure ({df.height} rows) …")
+    print(f"[*] Writing protein_secondary_structure ({df.height} rows) ...")
     df.write_database(
         table_name="protein_secondary_structure",
         connection=uri,

@@ -82,34 +82,24 @@ def mpnn_forward(
     n2_feat = tl.load(n2_feat_addr, mask=node_mask, other=0.0)
     e_feat = tl.load(e_feat_addr, mask=e_feat_mask, other=0.0)
     n1_coord = tl.load(n1_coord_addr, mask=coord_mask, other=0.0)
-    n2_coord = tl.load(n2_coord_addr, mask=coord_mask,  other=0.0)
+    n2_coord = tl.load(n2_coord_addr, mask=coord_mask, other=0.0)
     
-    """
-    # 4. RBF distances calculation
-    rbf_seq = tl.arange(0, RBF_DIM)
-    centers = tl.load(rbf_centers_ptr + rbf_seq)
-
+    # 4. Distance calculation
+    # Raw squared distance passed as a scalar per edge (broadcasted into the MLP
+    # via elementwise add instead of tl.dot, since RBF_DIM=1 is too small for tl.dot)
     x_inc = n1_coord - n2_coord
-    x = x_inc * x_inc
-    x = tl.sum(x, axis=1)
-    x = tl.sqrt(x)
-    centered_x = x[:, None] - centers[None, :]
-    distances = tl.exp(-rbf_gamma * (centered_x * centered_x))
-    """
-    x_inc = n1_coord - n2_coord
-    sq_dist = tl.sum(x_inc * x_inc, axis=1)
-    distances = sq_dist[:, None]
+    sq_dist = tl.sum(x_inc * x_inc, axis=1)  # (BLOCK_E,)
     
     # 5. MLP partial message obtention
-    Y1, Y2 = message_mlp(F_NODE, F_EDGE, OUT_FEATURES, HIDDEN_FEATURES, RBF_DIM, 
-                n1_feat, n2_feat, distances, e_feat, w1_msg_ptr, w2_msg_ptr, MSG_BETA, MSG_ACT_TYPE)
+    Y1, Y2 = message_mlp(F_NODE, F_EDGE, OUT_FEATURES, HIDDEN_FEATURES,
+                n1_feat, n2_feat, sq_dist, e_feat, w1_msg_ptr, w2_msg_ptr, MSG_BETA, MSG_ACT_TYPE)
     
     # 6. MLP edges movement obtention
     mov1, mov2 = movement_mlp(Y1, Y2, w1_mov_ptr, w2_mov_ptr, OUT_FEATURES, HID_FEAT_MOV_MLP, MOV_BETA, MOV_ACT_TYPE)
     new_pos1 = x_inc * mov1
     new_pos2 = -x_inc * mov2
     
-    # 7. Messages and distances saving
+    # 7. Messages and movement saving
     horizontal_sequence = tl.arange(0, OUT_FEATURES)
     out_msg1_addr = out_msg1_ptr + (node1[:, None] * OUT_FEATURES) + horizontal_sequence[None, :]
     out_msg2_addr = out_msg2_ptr + (node2[:, None] * OUT_FEATURES) + horizontal_sequence[None, :]
@@ -122,39 +112,47 @@ def mpnn_forward(
     tl.atomic_add(out_msg2_addr, Y2, mask=edges_mask[:, None])
     tl.atomic_add(out_mov1_addr, new_pos1, mask=mov_mask)
     tl.atomic_add(out_mov2_addr, new_pos2, mask=mov_mask)
+
     
 @triton.jit
 def message_mlp(
     FEAT_N: tl.constexpr, FEAT_E: tl.constexpr, 
     OUT_FEAT: tl.constexpr, HIDDEN_FEAT: tl.constexpr, 
-    RBF_DIM: tl.constexpr, 
-    n1, n2, distance, edge_feat, 
+    n1, n2, sq_dist, edge_feat,      # sq_dist is now (BLOCK_E,) scalar per edge
     w1_msg_ptr, w2_msg_ptr,
     MSG_BETA: tl.constexpr,
     MSG_ACT_TYPE: tl.constexpr
     ):
     vertical_n_sequence = tl.arange(0, FEAT_N)
     vertical_e_sequence = tl.arange(0, FEAT_E)
-    vertical_d_sequence = tl.arange(0, RBF_DIM)
     horizontal_sequence = tl.arange(0, HIDDEN_FEAT)
     
+    # w1_msg layout: [W_n1 | W_n2 | W_dist_col | W_edge]
+    # W_dist is stored as a single column (HIDDEN_FEAT,) — one scalar input
     node_size = FEAT_N * HIDDEN_FEAT
-    distance_size = RBF_DIM * HIDDEN_FEAT
     node2_offset = w1_msg_ptr + node_size
-    distance_offset = node2_offset + node_size
-    edge_offset = distance_offset + distance_size
-    
-    n1_w_addr = w1_msg_ptr + (vertical_n_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
-    n2_w_addr = node2_offset + (vertical_n_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
-    d_w_addr = distance_offset + (vertical_d_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
-    edge_w_addr = edge_offset + (vertical_e_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
-    
-    W_n1 = tl.load(n1_w_addr, other=0.0)
-    W_n2 = tl.load(n2_w_addr, other=0.0)
-    W_d = tl.load(d_w_addr, other=0.0)
-    W_e = tl.load(edge_w_addr, other=0.0)
-    
-    Y = tl.dot(distance, W_d) + tl.dot(edge_feat, W_e)
+    dist_col_offset = node2_offset + node_size        # (HIDDEN_FEAT,) vector
+    edge_offset = dist_col_offset + HIDDEN_FEAT       # (FEAT_E, HIDDEN_FEAT)
+
+    n1_w_addr   = w1_msg_ptr   + (vertical_n_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
+    n2_w_addr   = node2_offset + (vertical_n_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
+    edge_w_addr = edge_offset  + (vertical_e_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
+    dist_w_addr = dist_col_offset + horizontal_sequence   # (HIDDEN_FEAT,)
+
+    # Masks are all-true (weights fully in-bounds), but Triton requires mask when other= is used
+    true_mask_2d_n    = (vertical_n_sequence[:, None] >= 0) & (horizontal_sequence[None, :] >= 0)
+    true_mask_2d_e    = (vertical_e_sequence[:, None] >= 0) & (horizontal_sequence[None, :] >= 0)
+    true_mask_1d      = horizontal_sequence >= 0
+
+    W_n1 = tl.load(n1_w_addr,   mask=true_mask_2d_n, other=0.0)
+    W_n2 = tl.load(n2_w_addr,   mask=true_mask_2d_n, other=0.0)
+    W_e  = tl.load(edge_w_addr, mask=true_mask_2d_e, other=0.0)
+    W_d  = tl.load(dist_w_addr, mask=true_mask_1d,   other=0.0)  # (HIDDEN_FEAT,)
+
+    # Distance contribution: scalar * row-vector, broadcast over BLOCK_E
+    dist_contribution = sq_dist[:, None] * W_d[None, :]  # (BLOCK_E, HIDDEN_FEAT)
+
+    Y = dist_contribution + tl.dot(edge_feat, W_e)
     Y1 = tl.dot(n1, W_n1) + tl.dot(n2, W_n2) + Y
     Y2 = tl.dot(n2, W_n1) + tl.dot(n1, W_n2) + Y
     
@@ -167,8 +165,9 @@ def message_mlp(
     
     horizontal_h_sequence = tl.arange(0, OUT_FEAT)
     hl_w_addr = w2_msg_ptr + (horizontal_sequence[:, None] * OUT_FEAT) + horizontal_h_sequence[None, :]
-    
-    W_hl = tl.load(hl_w_addr, other=0.0)
+    true_mask_hidden = (horizontal_sequence[:, None] >= 0) & (horizontal_h_sequence[None, :] >= 0)
+
+    W_hl = tl.load(hl_w_addr, mask=true_mask_hidden, other=0.0)
     Y1 = tl.dot(X1, W_hl)
     Y2 = tl.dot(X2, W_hl)
     
@@ -179,6 +178,7 @@ def message_mlp(
         X1 = Y1 * tl.sigmoid(Y1)
         X2 = Y2 * tl.sigmoid(Y2)
     return X1, X2
+
     
 @triton.jit
 def movement_mlp(
@@ -193,8 +193,9 @@ def movement_mlp(
     horizontal_sequence = tl.arange(0, HIDDEN_FEAT)
     
     w1_addr = w1_mov_ptr + (vertical_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
-    
-    W1_edge = tl.load(w1_addr, other=0.0)
+    true_mask_w1 = (vertical_sequence[:, None] >= 0) & (horizontal_sequence[None, :] >= 0)
+
+    W1_edge = tl.load(w1_addr, mask=true_mask_w1, other=0.0)
     
     Y1 = tl.dot(x1, W1_edge)
     Y2 = tl.dot(x2, W1_edge)
@@ -206,12 +207,18 @@ def movement_mlp(
         X1 = Y1 * tl.sigmoid(Y1)
         X2 = Y2 * tl.sigmoid(Y2)
     
-    seq_1 = tl.arange(0, 1)
-    w2_addr = w2_mov_ptr + (horizontal_sequence[:, None] * 1) + seq_1[None, :]
-    
-    W2_edge = tl.load(w2_addr, other=0.0)
-    
-    return tl.dot(X1, W2_edge), tl.dot(X2, W2_edge)
+    # w2_mov is (HIDDEN_FEAT, 1) — tl.dot can't handle dim=1 output.
+    # Load as a (HIDDEN_FEAT,) vector and use elementwise sum instead.
+    true_mask_w2 = horizontal_sequence >= 0
+    w2_addr = w2_mov_ptr + horizontal_sequence
+    W2_edge = tl.load(w2_addr, mask=true_mask_w2, other=0.0)  # (HIDDEN_FEAT,)
+
+    # Dot product manually: sum(X * W2) over hidden dim → (BLOCK_E, 1)
+    out1 = tl.sum(X1 * W2_edge[None, :], axis=1)[:, None]  # (BLOCK_E, 1)
+    out2 = tl.sum(X2 * W2_edge[None, :], axis=1)[:, None]  # (BLOCK_E, 1)
+
+    return out1, out2
+
     
 @triton.jit
 def swish(Y, BETA: tl.constexpr):

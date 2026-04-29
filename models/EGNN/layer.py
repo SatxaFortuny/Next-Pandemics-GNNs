@@ -52,7 +52,7 @@ class EGNN_Triton_Layer(nn.Module):
         self.msg_beta = nn.Parameter(torch.tensor([msg_beta], dtype=torch.float32), requires_grad=msg_trainable_beta)
         self.mov_beta = nn.Parameter(torch.tensor([mov_beta], dtype=torch.float32), requires_grad=mov_trainable_beta)
 
-        msg_in_dim = (f_node * 2) + rbf_dim + f_edge
+        msg_in_dim = (f_node * 2) + 1 + f_edge   # 1 for the scalar distance weight row
         self.w1_msg = nn.Parameter(torch.randn(msg_in_dim, msg_hidden_dim) / msg_hidden_dim**0.5)
         self.w2_msg = nn.Parameter(torch.randn(msg_hidden_dim, msg_out_feat) / msg_out_feat**0.5)
         
@@ -84,7 +84,7 @@ class EGNN_Triton_Layer(nn.Module):
         out_msg1 = torch.zeros((num_nodes, self.OUT_FEATURES), device=node_feat.device, dtype=node_feat.dtype)
         out_msg2 = torch.zeros_like(out_msg1)
         
-        out_mov1 = torch.zeros((num_nodes, 3), device=coord.device, dtype=coord.dtype)
+        out_mov1 = torch.zeros((num_nodes, coord.shape[1]), device=coord.device, dtype=coord.dtype)
         out_mov2 = torch.zeros_like(out_mov1)
         
         src_idx = edge_index[0]
@@ -93,12 +93,9 @@ class EGNN_Triton_Layer(nn.Module):
         ones = torch.ones(num_edges, dtype=coord.dtype, device=coord.device)
         degree = torch.zeros(num_nodes, dtype=coord.dtype, device=coord.device)
         
-        # Because your kernel processes bi-directionally, a node gets a coordinate 
-        # update both when it's the source (out_mov1) and destination (out_mov2)
         degree.scatter_add_(0, src_idx, ones)
         degree.scatter_add_(0, dst_idx, ones)
         
-        # Clamp to 1.0 to prevent divide-by-zero for disconnected nodes
         degree = torch.clamp(degree, min=1.0)
 
         grid = lambda meta: (triton.cdiv(num_edges, meta['BLOCK_E']), )

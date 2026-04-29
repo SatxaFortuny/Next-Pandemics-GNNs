@@ -2,35 +2,48 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from egnn import E_GCL
+# Importamos las utilidades de PyTorch Geometric para el dataset real
+from torch_geometric.datasets import QM9
+from torch_geometric.loader import DataLoader
 
+# Satorras E_GCL — import the bare layer, no embedding wrappers
+from egnn_clean import E_GCL
 from layer import EGNN_Triton_Layer
 
-NUM_NODES = 5000
-NUM_EDGES = 40000
+# ── Parámetros del modelo ─────────────────────────────────────────────────────
+BATCH_SIZE = 32
 
-F_NODE = 32
-F_EDGE = 8
+F_NODE     = 32
+F_EDGE     = 16   # must be >= 16 for tl.dot in the Triton kernel
 HIDDEN_DIM = 64
 
-print(f"Creating graph with {NUM_NODES} nodes and {NUM_EDGES} edges...")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ── Base (unidirectional) edges ───────────────────────────────────────────────
-edge_index = torch.randint(0, NUM_NODES, (2, NUM_EDGES), device=device)
-edge_attr  = torch.randn((NUM_EDGES, F_EDGE), device=device)
+# ── Carga de datos reales (QM9) ───────────────────────────────────────────────
+print("Cargando dataset QM9 (se descargará automáticamente la primera vez)...")
+dataset = QM9(root='./data/QM9')
 
-# Satorras E_GCL is unidirectional (src→dst only), so double the edges so it
-# sees the same total message volume as the bidirectional Triton kernel.
-edge_index_bi = torch.cat([edge_index, edge_index.flip(0)], dim=1)  # (2, 2*NUM_EDGES)
-edge_attr_bi  = torch.cat([edge_attr,  edge_attr],           dim=0)  # (2*NUM_EDGES, F_EDGE)
+# DataLoader agrupa automáticamente las moléculas calculando el "offset" internamente
+loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-x   = torch.randn((NUM_NODES, F_NODE), device=device)
-pos = torch.randn((NUM_NODES, 3),      device=device)
+# Extraemos un único batch para el benchmark
+batch = next(iter(loader)).to(device)
+
+# QM9 usa 11 características para nodos y 4 para aristas.
+# Hacemos "padding" con ceros para igualarlas a tus requerimientos (32 y 16)
+x_real = F.pad(batch.x, (0, F_NODE - batch.x.shape[1]))
+edge_attr_real = F.pad(batch.edge_attr, (0, F_EDGE - batch.edge_attr.shape[1]))
+pos_real = batch.pos
+edge_index_real = batch.edge_index
+
+print(f"\n--- Estadísticas del Batch QM9 (Real) ---")
+print(f"Batch size      : {BATCH_SIZE} moléculas")
+print(f"Nodos totales   : {x_real.shape[0]} (Promedio de ~{x_real.shape[0]/BATCH_SIZE:.1f} átomos por molécula)")
+print(f"Aristas totales : {edge_index_real.shape[1]}")
+print(f"Dimensión x     : {x_real.shape}")
+print(f"Dimensión edges : {edge_attr_real.shape}")
 
 # ── Satorras E_GCL wrapper ────────────────────────────────────────────────────
-# Use E_GCL directly — no embedding_in / embedding_out — so the parameter count
-# and compute match the Triton layer exactly.
 egcl = E_GCL(
     input_nf=F_NODE,
     output_nf=F_NODE,
@@ -39,26 +52,22 @@ egcl = E_GCL(
 ).to(device)
 
 class SatorrasWrapper(nn.Module):
-    """Feeds the bidirectional edge list so message volume == Triton kernel."""
     def __init__(self, layer):
         super().__init__()
         self.layer = layer
 
     def forward(self, x, pos, edge_index, edge_attr):
-        # edge_index / edge_attr already doubled by the caller
         h, new_pos, _ = self.layer(x, edge_index, pos, edge_attr=edge_attr)
         return h, new_pos
 
 # ── Triton wrapper ────────────────────────────────────────────────────────────
-# The kernel loads coord with tl.arange(0,4) but masks col>=3, so we pad (N,3)
-# to (N,4) to satisfy stride arithmetic without leaking garbage data.
 class TritonWrapper(nn.Module):
     def __init__(self, layer):
         super().__init__()
         self.layer = layer
 
     def forward(self, x, pos, edge_index, edge_attr):
-        pos4 = F.pad(pos, (0, 1))                           # (N,3) -> (N,4)
+        pos4 = F.pad(pos, (0, 1))
         new_feat, new_coord4 = self.layer(x, pos4, edge_index, edge_attr)
         return new_feat, new_coord4[:, :3]
 
@@ -96,18 +105,21 @@ def run_benchmark(model, name, x, pos, edge_index, edge_attr, iters=200, warmup=
     print(f"[{name}] {ms:.3f} ms / iter")
     return ms
 
-# Satorras gets the doubled edge list; Triton gets the original (it doubles internally)
+# Nota: Los grafos de PyG (QM9) ya son bidireccionales por defecto, 
+# por lo que pasamos el mismo edge_index a ambos modelos de forma justa.
 time_satorras = run_benchmark(
     SatorrasWrapper(egcl), "Satorras E_GCL",
-    x, pos, edge_index_bi, edge_attr_bi
+    x_real, pos_real, edge_index_real, edge_attr_real
 )
+
 time_triton = run_benchmark(
     TritonWrapper(my_egnn), "EGNN Triton",
-    x, pos, edge_index, edge_attr
+    x_real, pos_real, edge_index_real, edge_attr_real
 )
 
 print("\n" + "=" * 50)
-print(f"Satorras E_GCL : {time_satorras:.3f} ms  (bidirectional edges, no embeddings)")
-print(f"Triton EGNN    : {time_triton:.3f} ms  (bidirectional kernel, original edges)")
+print(f"Batch size     : {BATCH_SIZE} moléculas (Dataset QM9)")
+print(f"Satorras E_GCL : {time_satorras:.3f} ms")
+print(f"Triton EGNN    : {time_triton:.3f} ms")
 print(f"Speedup        : {time_satorras / time_triton:.2f}x")
 print("=" * 50)
